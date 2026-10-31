@@ -202,7 +202,7 @@ def run_upload():
             r.raise_for_status()
             abort(502)
     # Keep each dispatch below the HTTP deadline, then enqueue continuation.
-    deadline = time.monotonic() + 20 * 60
+    deadline = time.monotonic() + 3 * 60
     while offset < size:
         if time.monotonic() >= deadline:
             enqueue(jid)
