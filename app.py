@@ -1,12 +1,14 @@
 import os, secrets, json, time
 import requests
 from flask import Flask, request, redirect, session, url_for, render_template_string, abort
+from werkzeug.middleware.proxy_fix import ProxyFix
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.secret_key = os.environ["FLASK_SECRET_KEY"]
 app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/youtube.upload", "openid", "https://www.googleapis.com/auth/userinfo.email"]
@@ -32,7 +34,7 @@ def index():
     c=creds()
     if c is None:return CSS+'<h1>Drive → YouTube</h1><p>Upload your Google Drive performances to YouTube.</p><a href="/login">Sign in with Google</a>'
     drive=build("drive","v3",credentials=c,cache_discovery=False)
-    data=drive.files().list(q="mimeType contains 'video/' and trashed = false",fields="nextPageToken,files(id,name,mimeType,size)",page_size=100).execute()
+    data=drive.files().list(q="mimeType contains 'video/' and trashed = false",fields="nextPageToken,files(id,name,mimeType,size)",pageSize=100).execute()
     template=CSS+'<h1>Drive → YouTube</h1><p>Choose a video to upload privately.</p>{% for f in files %}<div class="item"><a href="{{url_for(\'edit\',file_id=f.id)}}">{{f.name}}</a></div>{% endfor %}<p><small>Showing up to 100 videos.</small></p><a href="/logout">Sign out</a>'
     return render_template_string(template,files=data.get("files",[]))
 @app.route("/login")
@@ -59,10 +61,12 @@ def edit(file_id):
     drive=build("drive","v3",credentials=require_creds(),cache_discovery=False)
     f=drive.files().get(fileId=file_id,fields="id,name,mimeType,size").execute()
     if not f["mimeType"].startswith("video/"):abort(400)
-    template=CSS+'<a href="/">Back</a><h2>{{name}}</h2><form action="{{url_for(\'upload\',file_id=id)}}" method="post"><label>Title<input required maxlength="100" name="title" value="{{name}}"></label><label>Description and hashtags<textarea name="description" rows="6"></textarea></label><label>Tags (comma separated)<input name="tags"></label><p>Privacy: <b>Private</b></p><button type="submit">Upload to YouTube</button></form><small>Keep this page open until upload finishes. Uploads may take several minutes.</small>'
-    return render_template_string(template,id=file_id,name=f["name"])
+    session['csrf']=secrets.token_urlsafe(24)
+    template=CSS+'<a href="/">Back</a><h2>{{name}}</h2><form action="{{url_for(\'upload\',file_id=id)}}" method="post"><input type="hidden" name="csrf" value="{{csrf}}"><label>Title<input required maxlength="100" name="title" value="{{name}}"></label><label>Description and hashtags<textarea name="description" rows="6"></textarea></label><label>Tags (comma separated)<input name="tags"></label><p>Privacy: <b>Private</b></p><button type="submit">Upload to YouTube</button></form><small>Keep this page open until upload finishes. Uploads may take several minutes.</small>'
+    return render_template_string(template,id=file_id,name=f["name"],csrf=session['csrf'])
 @app.route("/upload/<file_id>",methods=["POST"])
 def upload(file_id):
+    if not secrets.compare_digest(request.form.get('csrf',''),session.get('csrf','missing')):abort(403,'Invalid form token')
     c=require_creds()
     d=build("drive","v3",credentials=c,cache_discovery=False)
     f=d.files().get(fileId=file_id,fields="id,name,mimeType,size").execute()
@@ -76,6 +80,8 @@ def upload(file_id):
     init=requests.post("https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",headers=headers,json=metadata,timeout=60)
     init.raise_for_status()
     location=init.headers["Location"]
+    if not location.startswith('https://www.googleapis.com/') and not location.startswith('https://youtube.googleapis.com/'):
+        abort(502,'Unexpected YouTube upload endpoint')
     offset=0
     while offset<size:
         end=min(size,offset+8*1024*1024)-1
