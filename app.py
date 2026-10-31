@@ -28,15 +28,114 @@ def require_creds():
     c=creds()
     if c is None:abort(401,"Please sign in again.")
     return c
-CSS="<style>body{font:16px system-ui;background:#10151e;color:#f8fafc;max-width:740px;margin:24px auto;padding:12px}a{color:#a9c9ff}input,textarea,button{font:inherit;padding:12px;box-sizing:border-box;width:100%;margin:8px 0 16px;border-radius:8px}input,textarea{background:#242d3b;color:white;border:1px solid #758398}button{background:#8fb4ff;border:0;font-weight:600}.item{padding:15px 0;border-bottom:1px solid #4b5563}small{color:#aab3c0}</style>"
+CSS="""<style>
+*{box-sizing:border-box}body{font:16px system-ui;background:#10151e;color:#f8fafc;max-width:1050px;margin:24px auto;padding:16px}
+a{color:#a9c9ff}input,textarea,button{font:inherit;padding:12px;border-radius:8px}input,textarea{background:#242d3b;color:white;border:1px solid #758398}
+button{background:#8fb4ff;border:0;font-weight:600;cursor:pointer}button:disabled{opacity:.5;cursor:default}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:20px 0}.toolbar button{width:auto}
+.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px}
+.tile{background:#1c2635;border:2px solid transparent;border-radius:12px;overflow:hidden;cursor:pointer}.tile.selected{border-color:#8fb4ff}
+.tile img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#303b4a}
+.tile .details{padding:10px;overflow-wrap:anywhere}.tile small{color:#aab3c0}
+.tile input{width:auto;margin:0 8px 0 0;accent-color:#8fb4ff}.tile .name{font-weight:600}
+.queue{background:#1c2635;padding:16px;border-radius:12px;margin-top:24px}.queue div{padding:5px 0}
+small{color:#aab3c0}label{display:block}#status{white-space:pre-wrap}
+</style>"""
 @app.route("/")
 def index():
     c=creds()
-    if c is None:return CSS+'<h1>Drive → YouTube</h1><p>Upload your Google Drive performances to YouTube.</p><a href="/login">Sign in with Google</a>'
+    if c is None:
+        return CSS+'<h1>Drive → YouTube</h1><p>Upload your Google Drive performances to YouTube.</p><a href="/login">Sign in with Google</a>'
     drive=build("drive","v3",credentials=c,cache_discovery=False)
-    data=drive.files().list(q="mimeType contains 'video/' and trashed = false",fields="nextPageToken,files(id,name,mimeType,size)",pageSize=100).execute()
-    template=CSS+'<h1>Drive → YouTube</h1><p>Choose a video to upload privately.</p>{% for f in files %}<div class="item"><a href="{{url_for(\'edit\',file_id=f.id)}}">{{f.name}}</a></div>{% endfor %}<p><small>Showing up to 100 videos.</small></p><a href="/logout">Sign out</a>'
-    return render_template_string(template,files=data.get("files",[]))
+    files=[]
+    page=None
+    # Follow Drive pagination rather than silently omitting everything after 100.
+    while True:
+        data=drive.files().list(q="mimeType contains 'video/' and trashed = false",
+            fields="nextPageToken,files(id,name,mimeType,size,thumbnailLink,webViewLink)",
+            pageSize=1000,pageToken=page).execute()
+        files.extend(data.get("files",[]))
+        page=data.get("nextPageToken")
+        if not page or len(files)>=3000:break
+    session["csrf"]=secrets.token_urlsafe(24)
+    template=CSS+r"""
+    <h1>Drive → YouTube</h1>
+    <p>Select multiple videos. Uploads are private by default.</p>
+    <div class="toolbar">
+      <input id="search" type="search" placeholder="Search videos" aria-label="Search videos">
+      <button type="button" onclick="selectVisible(true)">Select visible</button>
+      <button type="button" onclick="selectVisible(false)">Clear visible</button>
+      <strong id="count">0 selected</strong>
+    </div>
+    <div class="gallery">
+    {% for f in files %}
+      <div class="tile" data-id="{{f.id}}" data-name="{{f.name|e}}">
+        <img src="{{url_for('thumbnail',file_id=f.id)}}" alt="" loading="lazy">
+        <div class="details"><label><input type="checkbox" class="pick" aria-label="Select {{f.name|e}}"><span class="name">{{f.name}}</span></label>
+        <small>{% if f.size %}{{(f.size|int / 1048576)|round(1)}} MB{% endif %}</small>
+        <div><a href="{{url_for('edit',file_id=f.id)}}">Edit / upload individually</a>
+        {% if f.webViewLink %} · <a href="{{f.webViewLink}}" target="_blank" rel="noopener">Preview in Drive</a>{% endif %}</div></div>
+      </div>
+    {% endfor %}
+    </div>
+    <div class="queue"><h2>Batch upload</h2>
+    <p>Selected videos upload sequentially with their filenames as titles. Keep this page open until all finish.</p>
+    <button id="upload" type="button" onclick="uploadSelected()" disabled>Upload selected privately</button>
+    <div id="status" role="status" aria-live="polite"></div></div>
+    <p><small>Showing {{files|length}} videos{% if truncated %} (limited to first 3,000){% endif %}.</small></p>
+    <a href="/logout">Sign out</a>
+    <script>
+    const csrf={{csrf|tojson}};
+    const tiles=[...document.querySelectorAll('.tile')];
+    const search=document.getElementById('search');
+    const upload=document.getElementById('upload');
+    const status=document.getElementById('status');
+    function visible(t){return t.style.display!=='none'}
+    function update(){let n=document.querySelectorAll('.pick:checked').length;document.getElementById('count').textContent=n+' selected';upload.disabled=n===0}
+    search.addEventListener('input',()=>{const q=search.value.toLowerCase();tiles.forEach(t=>t.style.display=t.dataset.name.toLowerCase().includes(q)?'':'none')});
+    document.querySelectorAll('.pick').forEach(c=>c.addEventListener('change',()=>{c.closest('.tile').classList.toggle('selected',c.checked);update()}));
+    function selectVisible(v){tiles.filter(visible).forEach(t=>{let c=t.querySelector('.pick');c.checked=v;t.classList.toggle('selected',v)});update()}
+    async function uploadSelected(){
+      const chosen=tiles.filter(t=>t.querySelector('.pick').checked);
+      if(!confirm('Upload '+chosen.length+' video(s) to YouTube as PRIVATE?'))return;
+      upload.disabled=true;search.disabled=true;
+      let completed=0,failed=0;
+      for(let i=0;i<chosen.length;i++){
+        const t=chosen[i], name=t.dataset.name;
+        status.textContent+='\n['+(i+1)+'/'+chosen.length+'] Uploading '+name+' ...';
+        try{
+          const form=new FormData();form.set('csrf',csrf);form.set('title',name.replace(/\.[^.]+$/,'').slice(0,100));form.set('description','');form.set('tags','');
+          const response=await fetch('/upload/'+encodeURIComponent(t.dataset.id),{method:'POST',body:form,credentials:'same-origin'});
+          if(!response.ok)throw new Error('HTTP '+response.status+' — '+(await response.text()).replace(/<[^>]*>/g,' ').slice(0,160));
+          completed++;status.textContent+=' done';
+          t.querySelector('.pick').checked=false;t.classList.remove('selected');
+        }catch(e){failed++;status.textContent+=' FAILED: '+e.message}
+      }
+      status.textContent+='\nFinished: '+completed+' succeeded, '+failed+' failed.';
+      search.disabled=false;update();
+    }
+    </script>"""
+    return render_template_string(template,files=files[:3000],truncated=len(files)>=3000,csrf=session["csrf"])
+
+@app.route("/thumbnail/<file_id>")
+def thumbnail(file_id):
+    c=require_creds()
+    drive=build("drive","v3",credentials=c,cache_discovery=False)
+    f=drive.files().get(fileId=file_id,fields="id,mimeType,thumbnailLink").execute()
+    if not f.get("mimeType","").startswith("video/"):abort(404)
+    url=f.get("thumbnailLink")
+    if not url:abort(404)
+    from urllib.parse import urlparse
+    # Never fetch arbitrary URLs returned by an untrusted source.
+    host=(urlparse(url).hostname or "").lower()
+    if host not in ("lh3.googleusercontent.com","drive.google.com","docs.google.com") and not host.endswith(".googleusercontent.com"):
+        abort(502,"Unexpected thumbnail host")
+    r=requests.get(url,headers={"Authorization":"Bearer "+c.token},timeout=15)
+    r.raise_for_status()
+    if not r.headers.get("Content-Type","").startswith("image/") or len(r.content)>4*1024*1024:abort(502)
+    from flask import Response
+    return Response(r.content,content_type=r.headers["Content-Type"],headers={"Cache-Control":"private, max-age=300"})
+
 @app.route("/login")
 def login():
     f=oauth_flow()
