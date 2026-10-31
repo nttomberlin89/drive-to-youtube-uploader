@@ -11,6 +11,8 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.secret_key = os.environ["FLASK_SECRET_KEY"]
 app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+from background_queue import queue_bp
+app.register_blueprint(queue_bp)
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/youtube.upload", "openid", "https://www.googleapis.com/auth/userinfo.email"]
 # MVP only: ephemeral tokens, one instance, lost on restart. Replace with durable encrypted token storage for production.
 TOKENS = {}
@@ -79,9 +81,9 @@ def index():
     {% endfor %}
     </div>
     <div class="queue"><h2>Batch upload</h2>
-    <p>Selected videos upload sequentially with their filenames as titles. Keep this page open until all finish.</p>
+    <p>Uploads run on Google Cloud. You can close this page after queueing; return later to check progress.</p>
     <button id="upload" type="button" onclick="uploadSelected()" disabled>Upload selected privately</button>
-    <div id="status" role="status" aria-live="polite"></div></div>
+    <div id="status" role="status" aria-live="polite"></div><h3>Saved upload queue</h3><pre id="joblist" style="white-space:pre-wrap"></pre><button type="button" onclick="refreshQueue()">Refresh status</button></div>
     <p><small>Showing {{files|length}} videos{% if truncated %} (limited to first 3,000){% endif %}.</small></p>
     <a href="/logout">Sign out</a>
     <script>
@@ -97,23 +99,27 @@ def index():
     function selectVisible(v){tiles.filter(visible).forEach(t=>{let c=t.querySelector('.pick');c.checked=v;t.classList.toggle('selected',v)});update()}
     async function uploadSelected(){
       const chosen=tiles.filter(t=>t.querySelector('.pick').checked);
-      if(!confirm('Upload '+chosen.length+' video(s) to YouTube as PRIVATE?'))return;
-      upload.disabled=true;search.disabled=true;
-      let completed=0,failed=0;
-      for(let i=0;i<chosen.length;i++){
-        const t=chosen[i], name=t.dataset.name;
-        status.textContent+='\n['+(i+1)+'/'+chosen.length+'] Uploading '+name+' ...';
-        try{
-          const form=new FormData();form.set('csrf',csrf);form.set('title',name.replace(/\.[^.]+$/,'').slice(0,100));form.set('description','');form.set('tags','');
-          const response=await fetch('/upload/'+encodeURIComponent(t.dataset.id),{method:'POST',body:form,credentials:'same-origin'});
-          if(!response.ok)throw new Error('HTTP '+response.status+' — '+(await response.text()).replace(/<[^>]*>/g,' ').slice(0,160));
-          completed++;status.textContent+=' done';
-          t.querySelector('.pick').checked=false;t.classList.remove('selected');
-        }catch(e){failed++;status.textContent+=' FAILED: '+e.message}
-      }
-      status.textContent+='\nFinished: '+completed+' succeeded, '+failed+' failed.';
-      search.disabled=false;update();
+      if(!confirm('Queue '+chosen.length+' video(s) to YouTube as PRIVATE?'))return;
+      upload.disabled=true;
+      try {
+        const items=chosen.map(t=>({id:t.dataset.id,title:t.dataset.name.replace(/\\.[^.]+$/,'').slice(0,100)}));
+        const response=await fetch('/api/queue',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({items})});
+        if(!response.ok)throw Error('Could not queue: HTTP '+response.status+' '+(await response.text()).slice(0,160));
+        status.textContent='Queued successfully. You may close this window. Check back for progress.';
+        chosen.forEach(t=>{t.querySelector('.pick').checked=false;t.classList.remove('selected')});
+      }catch(e){status.textContent=e.message}
+      update();refreshQueue();
     }
+    async function refreshQueue(){
+      try{
+        const response=await fetch('/api/queue');
+        if(!response.ok)return;
+        const data=await response.json();
+        const lines=(data.jobs||[]).map(j=>j.name+' — '+j.status+' ('+Math.round(100*(j.offset||0)/(j.size||1))+'%)'+(j.error?' '+j.error:''));
+        document.getElementById('joblist').textContent=lines.join('\\n');
+      }catch(e){}
+    }
+    refreshQueue();
     </script>"""
     return render_template_string(template,files=files[:3000],truncated=len(files)>=3000,csrf=session["csrf"])
 
