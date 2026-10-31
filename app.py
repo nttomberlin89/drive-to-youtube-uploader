@@ -58,7 +58,7 @@ def index():
         page=data.get("nextPageToken")
         if not page or len(files)>=3000:break
     session["csrf"]=secrets.token_urlsafe(24)
-    template=CSS+"""
+    template=CSS+r"""
     <h1>Drive → YouTube</h1>
     <p>Select multiple videos. Uploads are private by default.</p>
     <div class="toolbar">
