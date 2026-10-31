@@ -189,7 +189,8 @@ def run_upload():
     else:
         # Query server's committed offset after a retry / interrupted worker.
         r = requests.put(location, headers={"Content-Length": "0",
-                         "Content-Range": "bytes */" + str(size)}, timeout=60)
+                         "Content-Range": "bytes */" + str(size),
+                         "Authorization": "Bearer " + token()}, timeout=60)
         if r.status_code in (200, 201):
             ref.update({"status": "completed", "video_id": r.json().get("id"),
                         "updated_at": firestore.SERVER_TIMESTAMP})
@@ -211,9 +212,12 @@ def run_upload():
             params={"alt": "media"}, headers={"Authorization": "Bearer " + token(),
             "Range": f"bytes={offset}-{end}"}, timeout=180)
         chunk.raise_for_status()
+        if chunk.status_code != 206 and (offset != 0 or len(chunk.content) != size):
+            abort(502, "Drive did not honor requested range")
         if len(chunk.content) != end - offset + 1:
             abort(502, "Drive range mismatch")
-        resp = requests.put(location, headers={"Content-Length": str(len(chunk.content)),
+        resp = requests.put(location, headers={"Authorization": "Bearer " + token(),
+            "Content-Length": str(len(chunk.content)),
             "Content-Range": f"bytes {offset}-{end}/{size}", "Content-Type": job["mime_type"]},
             data=chunk.content, timeout=180)
         if resp.status_code not in (200, 201, 308):
