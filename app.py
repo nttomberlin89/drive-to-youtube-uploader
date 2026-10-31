@@ -11,18 +11,22 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.secret_key = os.environ["FLASK_SECRET_KEY"]
 app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+from background_queue import queue_bp
+app.register_blueprint(queue_bp)
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/youtube.upload", "openid", "https://www.googleapis.com/auth/userinfo.email"]
-# MVP only: ephemeral tokens, one instance, lost on restart. Replace with durable encrypted token storage for production.
-TOKENS = {}
+from background_queue import db, cipher
+from google.cloud import firestore
 def oauth_flow():
     cfg={"web":{"client_id":os.environ["GOOGLE_CLIENT_ID"],"client_secret":os.environ["GOOGLE_CLIENT_SECRET"],"auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","redirect_uris":[url_for("callback",_external=True)]}}
     return Flow.from_client_config(cfg,scopes=SCOPES,redirect_uri=url_for("callback",_external=True))
 def creds():
-    rec=TOKENS.get(session.get("sid"))
-    if not rec:return None
-    c=Credentials.from_authorized_user_info(rec,SCOPES)
+    sid=session.get("sid")
+    if not sid:return None
+    snap=db().collection("oauth_sessions").document(sid).get()
+    if not snap.exists:return None
+    c=Credentials.from_authorized_user_info(json.loads(cipher().decrypt(snap.to_dict()["token"].encode())),SCOPES)
     if c.expired and c.refresh_token:
-        c.refresh(Request());TOKENS[session["sid"]]=json.loads(c.to_json())
+        c.refresh(Request());db().collection("oauth_sessions").document(sid).update({"token":cipher().encrypt(c.to_json().encode()).decode()})
     return c
 def require_creds():
     c=creds()
@@ -79,9 +83,9 @@ def index():
     {% endfor %}
     </div>
     <div class="queue"><h2>Batch upload</h2>
-    <p>Selected videos upload sequentially with their filenames as titles. Keep this page open until all finish.</p>
+    <p>Uploads run on Google Cloud. You can close this page after queueing; return later to check progress.</p>
     <button id="upload" type="button" onclick="uploadSelected()" disabled>Upload selected privately</button>
-    <div id="status" role="status" aria-live="polite"></div></div>
+    <div id="status" role="status" aria-live="polite"></div><h3>Saved upload queue</h3><pre id="joblist" style="white-space:pre-wrap"></pre><button type="button" onclick="refreshQueue()">Refresh status</button></div>
     <p><small>Showing {{files|length}} videos{% if truncated %} (limited to first 3,000){% endif %}.</small></p>
     <a href="/logout">Sign out</a>
     <script>
@@ -97,23 +101,27 @@ def index():
     function selectVisible(v){tiles.filter(visible).forEach(t=>{let c=t.querySelector('.pick');c.checked=v;t.classList.toggle('selected',v)});update()}
     async function uploadSelected(){
       const chosen=tiles.filter(t=>t.querySelector('.pick').checked);
-      if(!confirm('Upload '+chosen.length+' video(s) to YouTube as PRIVATE?'))return;
-      upload.disabled=true;search.disabled=true;
-      let completed=0,failed=0;
-      for(let i=0;i<chosen.length;i++){
-        const t=chosen[i], name=t.dataset.name;
-        status.textContent+='\n['+(i+1)+'/'+chosen.length+'] Uploading '+name+' ...';
-        try{
-          const form=new FormData();form.set('csrf',csrf);form.set('title',name.replace(/\.[^.]+$/,'').slice(0,100));form.set('description','');form.set('tags','');
-          const response=await fetch('/upload/'+encodeURIComponent(t.dataset.id),{method:'POST',body:form,credentials:'same-origin'});
-          if(!response.ok)throw new Error('HTTP '+response.status+' — '+(await response.text()).replace(/<[^>]*>/g,' ').slice(0,160));
-          completed++;status.textContent+=' done';
-          t.querySelector('.pick').checked=false;t.classList.remove('selected');
-        }catch(e){failed++;status.textContent+=' FAILED: '+e.message}
-      }
-      status.textContent+='\nFinished: '+completed+' succeeded, '+failed+' failed.';
-      search.disabled=false;update();
+      if(!confirm('Queue '+chosen.length+' video(s) to YouTube as PRIVATE?'))return;
+      upload.disabled=true;
+      try {
+        const items=chosen.map(t=>({id:t.dataset.id,title:t.dataset.name.replace(/\\.[^.]+$/,'').slice(0,100)}));
+        const response=await fetch('/api/queue',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({items})});
+        if(!response.ok)throw Error('Could not queue: HTTP '+response.status+' '+(await response.text()).slice(0,160));
+        status.textContent='Queued successfully. You may close this window. Check back for progress.';
+        chosen.forEach(t=>{t.querySelector('.pick').checked=false;t.classList.remove('selected')});
+      }catch(e){status.textContent=e.message}
+      update();refreshQueue();
     }
+    async function refreshQueue(){
+      try{
+        const response=await fetch('/api/queue');
+        if(!response.ok)return;
+        const data=await response.json();
+        const lines=(data.jobs||[]).map(j=>j.name+' — '+j.status+' ('+Math.round(100*(j.offset||0)/(j.size||1))+'%)'+(j.error?' '+j.error:''));
+        document.getElementById('joblist').textContent=lines.join('\\n');
+      }catch(e){}
+    }
+    refreshQueue();
     </script>"""
     return render_template_string(template,files=files[:3000],truncated=len(files)>=3000,csrf=session["csrf"])
 
@@ -153,7 +161,8 @@ def callback():
     profile=r.json()
     allowed=os.environ.get("ALLOWED_EMAIL","").strip().lower()
     if not allowed or not profile.get("email_verified") or profile.get("email","").lower()!=allowed:abort(403,"This Google account is not authorized")
-    sid=secrets.token_urlsafe(32);session["sid"]=sid;TOKENS[sid]=json.loads(c.to_json())
+    sid=secrets.token_urlsafe(32);session["sid"]=sid
+    db().collection("oauth_sessions").document(sid).set({"token":cipher().encrypt(c.to_json().encode()).decode(),"created_at":firestore.SERVER_TIMESTAMP})
     return redirect("/")
 @app.route("/edit/<file_id>")
 def edit(file_id):
@@ -185,7 +194,7 @@ def upload(file_id):
     while offset<size:
         end=min(size,offset+8*1024*1024)-1
         if c.expired:
-            c.refresh(Request());TOKENS[session["sid"]]=json.loads(c.to_json())
+            c.refresh(Request());db().collection("oauth_sessions").document(session["sid"]).update({"token":cipher().encrypt(c.to_json().encode()).decode()})
         chunk=requests.get("https://www.googleapis.com/drive/v3/files/"+file_id,params={"alt":"media"},headers={"Authorization":"Bearer "+c.token,"Range":f"bytes={offset}-{end}"},timeout=180)
         chunk.raise_for_status()
         if len(chunk.content)!=end-offset+1:abort(502,"Drive returned an unexpected chunk size")
@@ -195,6 +204,7 @@ def upload(file_id):
     return CSS+'<h2>Upload completed</h2><p>Video was submitted as private.</p><a href="/">Back to Drive videos</a>'
 @app.route("/logout")
 def logout():
-    TOKENS.pop(session.get("sid"),None);session.clear();return redirect("/")
+    if session.get("sid"):db().collection("oauth_sessions").document(session["sid"]).delete()
+    session.clear();return redirect("/")
 @app.route("/health")
 def health():return "ok"
