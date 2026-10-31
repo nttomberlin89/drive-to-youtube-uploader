@@ -32,6 +32,62 @@ def require_creds():
     c=creds()
     if c is None:abort(401,"Please sign in again.")
     return c
+# Only videos within the approved Drums folder (including nested folders).
+ALLOWED_DRIVE_FOLDER_IDS = ("1-HbgVClsa0SwLjhleegjRSwV0zrt0g-I",)
+
+def allowed_video(drive, file_id):
+    """Return metadata only when a video descends from an approved folder."""
+    from googleapiclient.errors import HttpError
+    try:
+        meta = drive.files().get(fileId=file_id, fields="id,name,mimeType,size,parents,thumbnailLink,webViewLink").execute()
+        if not meta.get("mimeType", "").startswith("video/"):
+            abort(404)
+        pending = list(meta.get("parents", []))
+        visited = set()
+        while pending:
+            folder_id = pending.pop()
+            if folder_id in ALLOWED_DRIVE_FOLDER_IDS:
+                return meta
+            if folder_id in visited:
+                continue
+            visited.add(folder_id)
+            parent = drive.files().get(fileId=folder_id, fields="id,parents,mimeType").execute()
+            pending.extend(parent.get("parents", []))
+    except HttpError as exc:
+        if exc.resp.status in (403, 404):
+            abort(404)
+        raise
+    abort(404, "Video is outside approved Drive folders")
+
+def approved_videos(drive, limit=3000):
+    """List videos by traversing approved folders, never searching the whole Drive."""
+    folders = list(ALLOWED_DRIVE_FOLDER_IDS)
+    seen_folders = set()
+    seen_videos = set()
+    videos = []
+    while folders and len(videos) < limit:
+        folder_id = folders.pop(0)
+        if folder_id in seen_folders:
+            continue
+        seen_folders.add(folder_id)
+        page = None
+        while True:
+            q = "'" + folder_id.replace("'", "\\'") + "' in parents and trashed = false"
+            result = drive.files().list(q=q, fields="nextPageToken,files(id,name,mimeType,size,thumbnailLink,webViewLink)",
+                                        pageSize=1000, pageToken=page).execute()
+            for item in result.get("files", []):
+                if item.get("mimeType") == "application/vnd.google-apps.folder":
+                    folders.append(item["id"])
+                elif item.get("mimeType", "").startswith("video/") and item["id"] not in seen_videos:
+                    seen_videos.add(item["id"])
+                    videos.append(item)
+                    if len(videos) >= limit:
+                        break
+            page = result.get("nextPageToken")
+            if not page or len(videos) >= limit:
+                break
+    return videos
+
 CSS="""<style>
 *{box-sizing:border-box}body{font:16px system-ui;background:#10151e;color:#f8fafc;max-width:1050px;margin:24px auto;padding:16px}
 a{color:#a9c9ff}input,textarea,button{font:inherit;padding:12px;border-radius:8px}input,textarea{background:#242d3b;color:white;border:1px solid #758398}
@@ -51,16 +107,7 @@ def index():
     if c is None:
         return CSS+'<h1>Drive → YouTube</h1><p>Upload your Google Drive performances to YouTube.</p><a href="/login">Sign in with Google</a>'
     drive=build("drive","v3",credentials=c,cache_discovery=False)
-    files=[]
-    page=None
-    # Follow Drive pagination rather than silently omitting everything after 100.
-    while True:
-        data=drive.files().list(q="mimeType contains 'video/' and trashed = false",
-            fields="nextPageToken,files(id,name,mimeType,size,thumbnailLink,webViewLink)",
-            pageSize=1000,pageToken=page).execute()
-        files.extend(data.get("files",[]))
-        page=data.get("nextPageToken")
-        if not page or len(files)>=3000:break
+    files=approved_videos(drive)
     session["csrf"]=secrets.token_urlsafe(24)
     template=CSS+r"""
     <h1>Drive → YouTube</h1>
@@ -129,7 +176,7 @@ def index():
 def thumbnail(file_id):
     c=require_creds()
     drive=build("drive","v3",credentials=c,cache_discovery=False)
-    f=drive.files().get(fileId=file_id,fields="id,mimeType,thumbnailLink").execute()
+    f=allowed_video(drive, file_id)
     if not f.get("mimeType","").startswith("video/"):abort(404)
     url=f.get("thumbnailLink")
     if not url:abort(404)
@@ -167,7 +214,7 @@ def callback():
 @app.route("/edit/<file_id>")
 def edit(file_id):
     drive=build("drive","v3",credentials=require_creds(),cache_discovery=False)
-    f=drive.files().get(fileId=file_id,fields="id,name,mimeType,size").execute()
+    f=allowed_video(drive, file_id)
     if not f["mimeType"].startswith("video/"):abort(400)
     session['csrf']=secrets.token_urlsafe(24)
     template=CSS+'<a href="/">Back</a><h2>{{name}}</h2><form action="{{url_for(\'upload\',file_id=id)}}" method="post"><input type="hidden" name="csrf" value="{{csrf}}"><label>Title<input required maxlength="100" name="title" value="{{name}}"></label><label>Description and hashtags<textarea name="description" rows="6"></textarea></label><label>Tags (comma separated)<input name="tags"></label><p>Privacy: <b>Private</b></p><button type="submit">Upload to YouTube</button></form><small>Keep this page open until upload finishes. Uploads may take several minutes.</small>'
@@ -177,7 +224,7 @@ def upload(file_id):
     if not secrets.compare_digest(request.form.get('csrf',''),session.get('csrf','missing')):abort(403,'Invalid form token')
     c=require_creds()
     d=build("drive","v3",credentials=c,cache_discovery=False)
-    f=d.files().get(fileId=file_id,fields="id,name,mimeType,size").execute()
+    f=allowed_video(d, file_id)
     if not f["mimeType"].startswith("video/"):abort(400)
     size=int(f.get("size",0))
     if size<=0:abort(400,"Video size is unavailable")
