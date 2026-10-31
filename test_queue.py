@@ -121,6 +121,19 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(busy, "busy")
         queue.release_job(lock, lease)
         self.assertIsNotNone(queue.claim_job(ref.id)[1])
+    def test_reconnect_preserves_deferred_job_without_extra_task(self):
+        ref=self.job()
+        ref.update({"status":"waiting_for_limit","next_retry_at":queue.now()+datetime.timedelta(hours=6)})
+        queue.reconnect_jobs("account-1",self.credentials)
+        self.enqueue.assert_not_called()
+        self.assertEqual(ref.get().to_dict()["status"],"waiting_for_limit")
+    def test_reconnect_resumes_verification_without_clearing_video(self):
+        ref=self.job()
+        ref.update({"status":"uploaded_unverified","video_id":"existing","location":"https://www.googleapis.com/saved"})
+        queue.reconnect_jobs("account-1",self.credentials)
+        self.enqueue.assert_called_once_with(ref.id)
+        self.assertEqual(ref.get().to_dict()["video_id"],"existing")
+        self.assertEqual(ref.get().to_dict()["status"],"verifying")
     def test_alias_worker_never_uploads(self):
         ref = self.job()
         alias = self.database.collection("upload_jobs").document("alias")
@@ -164,6 +177,13 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(result.status_code, 204)
         self.assertEqual(ref.get().to_dict()["status"], "uploaded_unverified")
         self.assertEqual(ref.get().to_dict()["video_id"], "existing")
+    def test_private_visibility_without_upload_confirmation_is_not_completed(self):
+        ref = self.job()
+        ref.update({"video_id":"existing", "status":"verifying"})
+        with patch.object(queue.requests, "get", return_value=response(200,{"items":[{"status":{"privacyStatus":"private"}}]})):
+            result = app.app.test_client().post("/tasks/upload", json={"job_id":ref.id})
+        self.assertEqual(result.status_code, 204)
+        self.assertEqual(ref.get().to_dict()["status"], "review_required")
     def test_expired_resumable_session_requires_review_not_reupload(self):
         ref = self.job()
         ref.update({"location":"https://www.googleapis.com/upload/youtube/v3/videos?upload_id=saved", "status":"uploading"})
@@ -181,6 +201,21 @@ class QueueTests(unittest.TestCase):
             with self.assertRaises(Exception) as raised:
                 app.allowed_video(drive, "outside-video")
         self.assertEqual(raised.exception.code, 404)
+
+class TaskPayloadTests(unittest.TestCase):
+    def test_repeated_deferred_task_is_deduplicated(self):
+        client=Mock()
+        client.queue_path.return_value="projects/project/locations/region/queues/queue"
+        config={"GCP_PROJECT":"project","TASKS_LOCATION":"region","TASKS_QUEUE":"queue","TASKS_TARGET_URL":"https://service.run.app","TASKS_SERVICE_ACCOUNT":"worker@example.com"}
+        when=queue.now()+datetime.timedelta(hours=6)
+        with patch.dict(os.environ,config), patch.object(queue,"task_client",return_value=client):
+            queue.enqueue("same-job",when)
+            first=client.create_task.call_args.kwargs["task"]
+            client.create_task.side_effect=queue.AlreadyExists("same task")
+            queue.enqueue("same-job",when)
+            second=client.create_task.call_args.kwargs["task"]
+        self.assertEqual(first["name"],second["name"])
+        self.assertEqual(first["schedule_time"],when)
 
 if __name__ == "__main__":
     unittest.main()

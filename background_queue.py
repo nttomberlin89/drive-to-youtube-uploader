@@ -22,6 +22,7 @@ from google.cloud import firestore, tasks_v2
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
+from google.api_core.exceptions import AlreadyExists
 from werkzeug.exceptions import HTTPException
 
 queue_bp = Blueprint("queue", __name__)
@@ -72,7 +73,16 @@ def enqueue(job_id, schedule_at=None):
     task["dispatch_deadline"] = {"seconds": 900}
     if schedule_at is not None:
         task["schedule_time"] = schedule_at
-    return task_client().create_task(parent=parent, task=task)
+        # Reconnecting Google or a retried delivery must not multiply deferred
+        # tasks for the same file and channel cooldown.
+        key = hashlib.sha256((job_id + ":" + schedule_at.isoformat()).encode()).hexdigest()
+        task["name"] = parent + "/tasks/deferred-" + key
+    try:
+        return task_client().create_task(parent=parent, task=task)
+    except AlreadyExists:
+        if schedule_at is None:
+            raise
+        return None
 
 def file_lock(file_id):
     return db().collection("upload_locks").document(hashlib.sha256(file_id.encode()).hexdigest())
@@ -175,8 +185,11 @@ def reconnect_jobs(account_id, credentials):
         if job.get("status") in ("auth_required", "uploaded_unverified", "enqueue_failed"):
             patch.update({"status": "verifying" if job.get("video_id") else "queued", "error": None})
         snap.reference.update(patch)
+        if job.get("status") == "waiting_for_limit" and job.get("next_retry_at") and job["next_retry_at"] > now():
+            # The deferred task reads the renewed credential when it runs.
+            continue
         try:
-            enqueue(snap.id, job.get("next_retry_at") if job.get("status") == "waiting_for_limit" else None)
+            enqueue(snap.id)
         except Exception:
             snap.reference.update({"error": "Reconnected; upload scheduling failed. Please reconnect again."})
 
@@ -280,7 +293,7 @@ def verify_video(ref, job, token):
         raise UploadProblem("video_not_found", "YouTube did not return this existing video. Review it before any new upload.")
     status = items[0].get("status", {})
     patch = {"privacy_status": status.get("privacyStatus"), "youtube_upload_status": status.get("uploadStatus"), "updated_at": firestore.SERVER_TIMESTAMP}
-    if status.get("privacyStatus") != "private" or status.get("uploadStatus") in ("failed", "rejected", "deleted"):
+    if status.get("privacyStatus") != "private" or status.get("uploadStatus") not in ("uploaded", "processed"):
         patch.update({"status": "review_required", "error": "YouTube requires review: visibility or processing did not match a successful private upload."})
     else:
         patch.update({"status": "completed", "offset": int(job["size"]), "privacy_verified_at": firestore.SERVER_TIMESTAMP, "error": None, "error_reason": None, "next_retry_at": None})
