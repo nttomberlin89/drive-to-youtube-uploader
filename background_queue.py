@@ -8,6 +8,7 @@ import datetime
 import json
 import os
 import secrets
+import time
 from urllib.parse import urlparse
 
 import google.auth.transport.requests
@@ -66,6 +67,7 @@ def enqueue(job_id):
         "body": json.dumps({"job_id": job_id}).encode(),
         "oidc_token": {"service_account_email": account, "audience": os.environ["TASKS_TARGET_URL"].rstrip("/")},
     }}
+    task["dispatch_deadline"] = {"seconds": 1800}
     return task_client().create_task(parent=parent, task=task)
 
 @queue_bp.post("/api/queue")
@@ -139,7 +141,7 @@ def verify_task():
             audience=os.environ["TASKS_TARGET_URL"].rstrip("/"))
     except Exception:
         abort(401)
-    if info.get("email") != os.environ["TASKS_SERVICE_ACCOUNT"] or not info.get("email_verified"):
+    if info.get("email") != os.environ["TASKS_SERVICE_ACCOUNT"]:
         abort(403)
 
 @queue_bp.post("/tasks/upload")
@@ -198,8 +200,12 @@ def run_upload():
         else:
             r.raise_for_status()
             abort(502)
-    # One task can run for up to Cloud Tasks' HTTP deadline; checkpoint every chunk.
+    # Keep each dispatch below the HTTP deadline, then enqueue continuation.
+    deadline = time.monotonic() + 20 * 60
     while offset < size:
+        if time.monotonic() >= deadline:
+            enqueue(jid)
+            return '', 204
         end = min(size, offset + 8 * 1024 * 1024) - 1
         chunk = requests.get("https://www.googleapis.com/drive/v3/files/" + job["file_id"],
             params={"alt": "media"}, headers={"Authorization": "Bearer " + token(),
@@ -213,7 +219,11 @@ def run_upload():
         if resp.status_code not in (200, 201, 308):
             resp.raise_for_status()
             abort(502, "Unexpected YouTube response")
-        offset = end + 1
+        if resp.status_code == 308:
+            rng = resp.headers.get('Range', '')
+            offset = int(rng.rsplit('-', 1)[-1]) + 1 if '-' in rng else 0
+        else:
+            offset = end + 1
         update = {"offset": offset, "updated_at": firestore.SERVER_TIMESTAMP}
         if resp.status_code in (200, 201):
             update.update({"status": "completed", "video_id": resp.json().get("id")})
