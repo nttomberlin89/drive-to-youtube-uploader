@@ -14,17 +14,19 @@ app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True, SESS
 from background_queue import queue_bp
 app.register_blueprint(queue_bp)
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/youtube.upload", "openid", "https://www.googleapis.com/auth/userinfo.email"]
-# MVP only: ephemeral tokens, one instance, lost on restart. Replace with durable encrypted token storage for production.
-TOKENS = {}
+from background_queue import db, cipher
+from google.cloud import firestore
 def oauth_flow():
     cfg={"web":{"client_id":os.environ["GOOGLE_CLIENT_ID"],"client_secret":os.environ["GOOGLE_CLIENT_SECRET"],"auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token","redirect_uris":[url_for("callback",_external=True)]}}
     return Flow.from_client_config(cfg,scopes=SCOPES,redirect_uri=url_for("callback",_external=True))
 def creds():
-    rec=TOKENS.get(session.get("sid"))
-    if not rec:return None
-    c=Credentials.from_authorized_user_info(rec,SCOPES)
+    sid=session.get("sid")
+    if not sid:return None
+    snap=db().collection("oauth_sessions").document(sid).get()
+    if not snap.exists:return None
+    c=Credentials.from_authorized_user_info(json.loads(cipher().decrypt(snap.to_dict()["token"].encode())),SCOPES)
     if c.expired and c.refresh_token:
-        c.refresh(Request());TOKENS[session["sid"]]=json.loads(c.to_json())
+        c.refresh(Request());db().collection("oauth_sessions").document(sid).update({"token":cipher().encrypt(c.to_json().encode()).decode()})
     return c
 def require_creds():
     c=creds()
@@ -159,7 +161,8 @@ def callback():
     profile=r.json()
     allowed=os.environ.get("ALLOWED_EMAIL","").strip().lower()
     if not allowed or not profile.get("email_verified") or profile.get("email","").lower()!=allowed:abort(403,"This Google account is not authorized")
-    sid=secrets.token_urlsafe(32);session["sid"]=sid;TOKENS[sid]=json.loads(c.to_json())
+    sid=secrets.token_urlsafe(32);session["sid"]=sid
+    db().collection("oauth_sessions").document(sid).set({"token":cipher().encrypt(c.to_json().encode()).decode(),"created_at":firestore.SERVER_TIMESTAMP})
     return redirect("/")
 @app.route("/edit/<file_id>")
 def edit(file_id):
@@ -191,7 +194,7 @@ def upload(file_id):
     while offset<size:
         end=min(size,offset+8*1024*1024)-1
         if c.expired:
-            c.refresh(Request());TOKENS[session["sid"]]=json.loads(c.to_json())
+            c.refresh(Request());db().collection("oauth_sessions").document(session["sid"]).update({"token":cipher().encrypt(c.to_json().encode()).decode()})
         chunk=requests.get("https://www.googleapis.com/drive/v3/files/"+file_id,params={"alt":"media"},headers={"Authorization":"Bearer "+c.token,"Range":f"bytes={offset}-{end}"},timeout=180)
         chunk.raise_for_status()
         if len(chunk.content)!=end-offset+1:abort(502,"Drive returned an unexpected chunk size")
@@ -201,6 +204,7 @@ def upload(file_id):
     return CSS+'<h2>Upload completed</h2><p>Video was submitted as private.</p><a href="/">Back to Drive videos</a>'
 @app.route("/logout")
 def logout():
-    TOKENS.pop(session.get("sid"),None);session.clear();return redirect("/")
+    if session.get("sid"):db().collection("oauth_sessions").document(session["sid"]).delete()
+    session.clear();return redirect("/")
 @app.route("/health")
 def health():return "ok"
