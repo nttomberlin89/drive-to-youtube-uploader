@@ -78,7 +78,7 @@ def add_jobs():
     items = payload.get("items", [])
     if not isinstance(items, list) or not 1 <= len(items) <= 100:
         abort(400, "Select 1–100 videos")
-    from app import require_creds
+    from app import require_creds, allowed_video
     credentials = require_creds()
     if not credentials.refresh_token:
         abort(400, "Sign out and sign in again to grant offline access")
@@ -89,7 +89,7 @@ def add_jobs():
         fid = item.get("id", "") if isinstance(item, dict) else ""
         if not isinstance(fid, str) or not fid or len(fid) > 200:
             abort(400, "Invalid file")
-        meta = drive.files().get(fileId=fid, fields="id,name,mimeType,size").execute()
+        meta = allowed_video(drive, fid)
         if not meta.get("mimeType", "").startswith("video/") or int(meta.get("size", 0)) <= 0:
             abort(400, "Not an uploadable video")
         title = (item.get("title") or meta["name"].rsplit(".", 1)[0]).strip()[:100]
@@ -169,6 +169,10 @@ def run_upload():
             c.refresh(Request())
             ref.update({"token": cipher().encrypt(c.to_json().encode()).decode()})
         return c.token
+    # Re-check folder membership when a task runs, including after a folder move.
+    from googleapiclient.discovery import build
+    from app import allowed_video
+    allowed_video(build("drive", "v3", credentials=c, cache_discovery=False), job["file_id"])
     size = int(job["size"])
     offset = int(job.get("offset") or 0)
     location = job.get("location")
