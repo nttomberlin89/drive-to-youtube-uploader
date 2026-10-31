@@ -13,7 +13,7 @@ app.secret_key = os.environ["FLASK_SECRET_KEY"]
 app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 from background_queue import queue_bp
 app.register_blueprint(queue_bp)
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/youtube.upload", "openid", "https://www.googleapis.com/auth/userinfo.email"]
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly", "openid", "https://www.googleapis.com/auth/userinfo.email"]
 from background_queue import db, cipher
 from google.cloud import firestore
 def oauth_flow():
@@ -24,10 +24,25 @@ def creds():
     if not sid:return None
     snap=db().collection("oauth_sessions").document(sid).get()
     if not snap.exists:return None
-    c=Credentials.from_authorized_user_info(json.loads(cipher().decrypt(snap.to_dict()["token"].encode())),SCOPES)
+    info=json.loads(cipher().decrypt(snap.to_dict()["token"].encode()))
+    c=Credentials.from_authorized_user_info(info, info.get("scopes"))
     if c.expired and c.refresh_token:
         c.refresh(Request());db().collection("oauth_sessions").document(sid).update({"token":cipher().encrypt(c.to_json().encode()).decode()})
     return c
+def account_identity():
+    """Use Google's stable account ID, including for existing browser sessions."""
+    c=require_creds()
+    ref=db().collection("oauth_sessions").document(session["sid"])
+    saved=ref.get().to_dict()
+    if saved.get("account_id"):
+        return saved["account_id"]
+    r=requests.get("https://openidconnect.googleapis.com/v1/userinfo",headers={"Authorization":"Bearer "+c.token},timeout=20)
+    r.raise_for_status()
+    profile=r.json()
+    if not profile.get("email_verified") or profile.get("email","").lower()!=os.environ.get("ALLOWED_EMAIL","").strip().lower():
+        abort(403)
+    ref.update({"account_id":profile["sub"]})
+    return profile["sub"]
 def require_creds():
     c=creds()
     if c is None:abort(401,"Please sign in again.")
@@ -151,7 +166,7 @@ def index():
       if(!confirm('Queue '+chosen.length+' video(s) to YouTube as PRIVATE?'))return;
       upload.disabled=true;
       try {
-        const items=chosen.map(t=>({id:t.dataset.id,title:t.dataset.name.replace(/\\.[^.]+$/,'').slice(0,100)}));
+        const items=chosen.map(t=>({id:t.dataset.id,title:t.dataset.name.replace(/\.[^.]+$/,'').slice(0,100)}));
         const response=await fetch('/api/queue',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({items})});
         if(!response.ok)throw Error('Could not queue: HTTP '+response.status+' '+(await response.text()).slice(0,160));
         status.textContent='Queued successfully. You may close this window. Check back for progress.';
@@ -164,11 +179,12 @@ def index():
         const response=await fetch('/api/queue');
         if(!response.ok)return;
         const data=await response.json();
-        const lines=(data.jobs||[]).map(j=>j.name+' — '+j.status+' ('+Math.round(100*(j.offset||0)/(j.size||1))+'%)'+(j.error?' '+j.error:''));
-        document.getElementById('joblist').textContent=lines.join('\\n');
+        const lines=(data.jobs||[]).map(j=>j.name+' — '+j.status.replaceAll('_',' ')+' ('+Math.round(100*(j.offset||0)/(j.size||1))+'%)'+(j.error?' '+j.error:'')+(j.next_retry_at?' Next check: '+new Date(j.next_retry_at).toLocaleString():'')+(j.video_id?' https://youtu.be/'+j.video_id:''));
+        document.getElementById('joblist').textContent=lines.join('\n');
       }catch(e){}
     }
     refreshQueue();
+    setInterval(refreshQueue,15000);
     </script>"""
     return render_template_string(template,files=files[:3000],truncated=len(files)>=3000,csrf=session["csrf"])
 
@@ -209,7 +225,9 @@ def callback():
     allowed=os.environ.get("ALLOWED_EMAIL","").strip().lower()
     if not allowed or not profile.get("email_verified") or profile.get("email","").lower()!=allowed:abort(403,"This Google account is not authorized")
     sid=secrets.token_urlsafe(32);session["sid"]=sid
-    db().collection("oauth_sessions").document(sid).set({"token":cipher().encrypt(c.to_json().encode()).decode(),"created_at":firestore.SERVER_TIMESTAMP})
+    db().collection("oauth_sessions").document(sid).set({"token":cipher().encrypt(c.to_json().encode()).decode(),"account_id":profile["sub"],"created_at":firestore.SERVER_TIMESTAMP})
+    from background_queue import reconnect_jobs
+    reconnect_jobs(profile["sub"], c)
     return redirect("/")
 @app.route("/edit/<file_id>")
 def edit(file_id):
@@ -217,41 +235,21 @@ def edit(file_id):
     f=allowed_video(drive, file_id)
     if not f["mimeType"].startswith("video/"):abort(400)
     session['csrf']=secrets.token_urlsafe(24)
-    template=CSS+'<a href="/">Back</a><h2>{{name}}</h2><form action="{{url_for(\'upload\',file_id=id)}}" method="post"><input type="hidden" name="csrf" value="{{csrf}}"><label>Title<input required maxlength="100" name="title" value="{{name}}"></label><label>Description and hashtags<textarea name="description" rows="6"></textarea></label><label>Tags (comma separated)<input name="tags"></label><p>Privacy: <b>Private</b></p><button type="submit">Upload to YouTube</button></form><small>Keep this page open until upload finishes. Uploads may take several minutes.</small>'
+    template=CSS+'<a href="/">Back</a><h2>{{name}}</h2><form action="{{url_for(\'upload\',file_id=id)}}" method="post"><input type="hidden" name="csrf" value="{{csrf}}"><label>Title<input required maxlength="100" name="title" value="{{name}}"></label><label>Description and hashtags<textarea name="description" rows="6"></textarea></label><label>Tags (comma separated)<input name="tags"></label><p>Privacy: <b>Private</b></p><button type="submit">Upload to YouTube</button></form><small>Uploads continue in the background. Check the saved queue for progress.</small>'
     return render_template_string(template,id=file_id,name=f["name"],csrf=session['csrf'])
 @app.route("/upload/<file_id>",methods=["POST"])
 def upload(file_id):
     if not secrets.compare_digest(request.form.get('csrf',''),session.get('csrf','missing')):abort(403,'Invalid form token')
     c=require_creds()
-    d=build("drive","v3",credentials=c,cache_discovery=False)
-    f=allowed_video(d, file_id)
-    if not f["mimeType"].startswith("video/"):abort(400)
-    size=int(f.get("size",0))
-    if size<=0:abort(400,"Video size is unavailable")
-    title=request.form.get("title","").strip()[:100]
-    if not title:abort(400)
-    metadata={"snippet":{"title":title,"description":request.form.get("description","")[:5000],"tags":[x.strip() for x in request.form.get("tags","").split(",") if x.strip()],"categoryId":"10"},"status":{"privacyStatus":"private","selfDeclaredMadeForKids":False}}
-    headers={"Authorization":"Bearer "+c.token,"X-Upload-Content-Type":f["mimeType"],"X-Upload-Content-Length":str(size)}
-    init=requests.post("https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",headers=headers,json=metadata,timeout=60)
-    init.raise_for_status()
-    location=init.headers["Location"]
-    if not location.startswith('https://www.googleapis.com/') and not location.startswith('https://youtube.googleapis.com/'):
-        abort(502,'Unexpected YouTube upload endpoint')
-    offset=0
-    while offset<size:
-        end=min(size,offset+8*1024*1024)-1
-        if c.expired:
-            c.refresh(Request());db().collection("oauth_sessions").document(session["sid"]).update({"token":cipher().encrypt(c.to_json().encode()).decode()})
-        chunk=requests.get("https://www.googleapis.com/drive/v3/files/"+file_id,params={"alt":"media"},headers={"Authorization":"Bearer "+c.token,"Range":f"bytes={offset}-{end}"},timeout=180)
-        chunk.raise_for_status()
-        if len(chunk.content)!=end-offset+1:abort(502,"Drive returned an unexpected chunk size")
-        resp=requests.put(location,headers={"Content-Length":str(len(chunk.content)),"Content-Range":f"bytes {offset}-{end}/{size}","Content-Type":f["mimeType"]},data=chunk.content,timeout=180)
-        if resp.status_code not in (200,201,308):abort(502,"YouTube upload error: "+resp.text[:300])
-        offset=end+1
-    return CSS+'<h2>Upload completed</h2><p>Video was submitted as private.</p><a href="/">Back to Drive videos</a>'
+    from background_queue import queue_video
+    queue_video(c, {"id":file_id,"title":request.form.get("title", ""),
+                   "description":request.form.get("description", ""),
+                   "tags":[x.strip() for x in request.form.get("tags", "").split(",") if x.strip()]})
+    return redirect("/", code=303)
 @app.route("/logout")
 def logout():
     if session.get("sid"):db().collection("oauth_sessions").document(session["sid"]).delete()
     session.clear();return redirect("/")
 @app.route("/health")
 def health():return "ok"
+
